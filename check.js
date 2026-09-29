@@ -132,8 +132,8 @@ async function getFlightState(icao24) {
       console.log("  " + name + ": request failed — " + e);
     }
   }
-  const fromOpenSky = await getFlightStateFromOpenSky(icao24).catch((e) => {
-    console.log("  OpenSky failed: " + e);
+  const fromOpenSky = await getFlightStateFromOpenSky(icao24, true).catch((e) => {
+    console.log("  OpenSky: request failed — " + e);
     return null;
   });
   if (fromOpenSky) {
@@ -143,14 +143,20 @@ async function getFlightState(icao24) {
   return null;
 }
 
-async function getFlightStateFromOpenSky(icao24) {
+async function getFlightStateFromOpenSky(icao24, verbose) {
   const resp = await fetch("https://opensky-network.org/api/states/all?icao24=" + icao24, {
     headers: { "User-Agent": "LiveryWatch/1.0 (personal aircraft tracker, run via GitHub Actions)" }
   });
-  if (!resp.ok) return null;
+  if (!resp.ok) {
+    if (verbose) console.log("  OpenSky: HTTP " + resp.status + " " + resp.statusText);
+    return null;
+  }
   const data = await resp.json();
   const row = data.states && data.states[0];
-  if (!row) return null;
+  if (!row) {
+    if (verbose) console.log("  OpenSky: reached OK, but no state vector (states: " + JSON.stringify(data.states) + ")");
+    return null;
+  }
   return { callsign: (row[1] || "").trim(), lon: row[5], lat: row[6], onGround: row[8], velocity: row[9] };
 }
 
