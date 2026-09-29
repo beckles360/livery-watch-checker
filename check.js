@@ -1,8 +1,10 @@
 // Livery Watch — GitHub Actions half.
 // Runs every 5 minutes (see .github/workflows/check.yml), fetches the
 // watch list from the Cloudflare Worker, checks each aircraft's live
-// position via adsb.one, and reports any state change back to the
-// Worker (which sends the ntfy.sh notification).
+// position across several community ADS-B sources (airplanes.live,
+// adsb.fi, adsb.one, OpenSky — tried in order until one has data), and
+// reports any state change back to the Worker (which sends the ntfy.sh
+// notification).
 
 const WORKER_URL = process.env.WORKER_URL;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
@@ -40,7 +42,7 @@ async function checkWatch(watch) {
 
   const flight = await getFlightState(icao24);
   if (!flight) {
-    console.log(watch.registration + " (" + icao24 + "): no current position from adsb.one");
+    console.log(watch.registration + " (" + icao24 + "): no current position from any source");
     return;
   }
 
@@ -97,6 +99,60 @@ async function getAirportPos(icaoCode) {
 }
 
 async function getFlightState(icao24) {
+  const sources = [
+    { name: "airplanes.live", fn: getFlightStateFromAirplanesLive },
+    { name: "adsb.fi", fn: getFlightStateFromAdsbFi },
+    { name: "adsb.one", fn: getFlightStateFromAdsbOne },
+    { name: "OpenSky", fn: getFlightStateFromOpenSky }
+  ];
+  for (const { name, fn } of sources) {
+    const result = await fn(icao24).catch((e) => {
+      console.log("  " + name + " failed: " + e);
+      return null;
+    });
+    if (result) {
+      console.log("  (source: " + name + ")");
+      return { ...result, source: name };
+    }
+  }
+  return null;
+}
+
+async function getFlightStateFromAirplanesLive(icao24) {
+  const resp = await fetch("https://api.airplanes.live/v2/hex/" + icao24, {
+    headers: { "User-Agent": "LiveryWatch/1.0 (personal aircraft tracker, run via GitHub Actions)" }
+  });
+  if (!resp.ok) return null;
+  const data = await resp.json();
+  const ac = data.ac && data.ac[0];
+  if (!ac) return null;
+  return {
+    callsign: (ac.flight || "").trim(),
+    lon: ac.lon,
+    lat: ac.lat,
+    onGround: ac.alt_baro === "ground",
+    velocity: ac.gs
+  };
+}
+
+async function getFlightStateFromAdsbFi(icao24) {
+  const resp = await fetch("https://opendata.adsb.fi/api/v2/hex/" + icao24, {
+    headers: { "User-Agent": "LiveryWatch/1.0 (personal aircraft tracker, run via GitHub Actions)" }
+  });
+  if (!resp.ok) return null;
+  const data = await resp.json();
+  const ac = data.ac && data.ac[0];
+  if (!ac) return null;
+  return {
+    callsign: (ac.flight || "").trim(),
+    lon: ac.lon,
+    lat: ac.lat,
+    onGround: ac.alt_baro === "ground",
+    velocity: ac.gs
+  };
+}
+
+async function getFlightStateFromAdsbOne(icao24) {
   const resp = await fetch("https://api.adsb.one/v2/hex/" + icao24, {
     headers: { "User-Agent": "LiveryWatch/1.0 (personal aircraft tracker, run via GitHub Actions)" }
   });
@@ -111,6 +167,17 @@ async function getFlightState(icao24) {
     onGround: ac.alt_baro === "ground",
     velocity: ac.gs
   };
+}
+
+async function getFlightStateFromOpenSky(icao24) {
+  const resp = await fetch("https://opensky-network.org/api/states/all?icao24=" + icao24, {
+    headers: { "User-Agent": "LiveryWatch/1.0 (personal aircraft tracker, run via GitHub Actions)" }
+  });
+  if (!resp.ok) return null;
+  const data = await resp.json();
+  const row = data.states && data.states[0];
+  if (!row) return null;
+  return { callsign: (row[1] || "").trim(), lon: row[5], lat: row[6], onGround: row[8], velocity: row[9] };
 }
 
 function isNear(lat, lon, pos, radiusKm) {
