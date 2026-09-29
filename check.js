@@ -100,73 +100,47 @@ async function getAirportPos(icaoCode) {
 
 async function getFlightState(icao24) {
   const sources = [
-    { name: "airplanes.live", fn: getFlightStateFromAirplanesLive },
-    { name: "adsb.fi", fn: getFlightStateFromAdsbFi },
-    { name: "adsb.one", fn: getFlightStateFromAdsbOne },
-    { name: "OpenSky", fn: getFlightStateFromOpenSky }
+    { name: "airplanes.live", url: "https://api.airplanes.live/v2/hex/" + icao24 },
+    { name: "adsb.fi", url: "https://opendata.adsb.fi/api/v2/hex/" + icao24 },
+    { name: "adsb.one", url: "https://api.adsb.one/v2/hex/" + icao24 }
   ];
-  for (const { name, fn } of sources) {
-    const result = await fn(icao24).catch((e) => {
-      console.log("  " + name + " failed: " + e);
-      return null;
-    });
-    if (result) {
+  for (const { name, url } of sources) {
+    try {
+      const resp = await fetch(url, {
+        headers: { "User-Agent": "LiveryWatch/1.0 (personal aircraft tracker, run via GitHub Actions)" }
+      });
+      if (!resp.ok) {
+        console.log("  " + name + ": HTTP " + resp.status + " " + resp.statusText);
+        continue;
+      }
+      const data = await resp.json();
+      const ac = data.ac && data.ac[0];
+      if (!ac) {
+        console.log("  " + name + ": reached OK, but no aircraft in response (ac: " + JSON.stringify(data.ac) + ")");
+        continue;
+      }
       console.log("  (source: " + name + ")");
-      return { ...result, source: name };
+      return {
+        callsign: (ac.flight || "").trim(),
+        lon: ac.lon,
+        lat: ac.lat,
+        onGround: ac.alt_baro === "ground",
+        velocity: ac.gs,
+        source: name
+      };
+    } catch (e) {
+      console.log("  " + name + ": request failed — " + e);
     }
   }
+  const fromOpenSky = await getFlightStateFromOpenSky(icao24).catch((e) => {
+    console.log("  OpenSky failed: " + e);
+    return null;
+  });
+  if (fromOpenSky) {
+    console.log("  (source: OpenSky)");
+    return { ...fromOpenSky, source: "OpenSky" };
+  }
   return null;
-}
-
-async function getFlightStateFromAirplanesLive(icao24) {
-  const resp = await fetch("https://api.airplanes.live/v2/hex/" + icao24, {
-    headers: { "User-Agent": "LiveryWatch/1.0 (personal aircraft tracker, run via GitHub Actions)" }
-  });
-  if (!resp.ok) return null;
-  const data = await resp.json();
-  const ac = data.ac && data.ac[0];
-  if (!ac) return null;
-  return {
-    callsign: (ac.flight || "").trim(),
-    lon: ac.lon,
-    lat: ac.lat,
-    onGround: ac.alt_baro === "ground",
-    velocity: ac.gs
-  };
-}
-
-async function getFlightStateFromAdsbFi(icao24) {
-  const resp = await fetch("https://opendata.adsb.fi/api/v2/hex/" + icao24, {
-    headers: { "User-Agent": "LiveryWatch/1.0 (personal aircraft tracker, run via GitHub Actions)" }
-  });
-  if (!resp.ok) return null;
-  const data = await resp.json();
-  const ac = data.ac && data.ac[0];
-  if (!ac) return null;
-  return {
-    callsign: (ac.flight || "").trim(),
-    lon: ac.lon,
-    lat: ac.lat,
-    onGround: ac.alt_baro === "ground",
-    velocity: ac.gs
-  };
-}
-
-async function getFlightStateFromAdsbOne(icao24) {
-  const resp = await fetch("https://api.adsb.one/v2/hex/" + icao24, {
-    headers: { "User-Agent": "LiveryWatch/1.0 (personal aircraft tracker, run via GitHub Actions)" }
-  });
-  if (!resp.ok) return null;
-  const data = await resp.json();
-  const ac = data.ac && data.ac[0];
-  if (!ac) return null;
-  return {
-    callsign: (ac.flight || "").trim(),
-    lon: ac.lon,
-    lat: ac.lat,
-    onGround: ac.alt_baro === "ground",
-    velocity: ac.gs
-  };
 }
 
 async function getFlightStateFromOpenSky(icao24) {
