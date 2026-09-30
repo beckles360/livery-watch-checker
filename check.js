@@ -82,10 +82,30 @@ async function checkWatch(watch) {
     };
   }
 
-  if (newState !== state) {
+  // While inbound, refresh progress/distance/ETA every check, even when
+  // the phase itself hasn't changed — this is what drives the page's
+  // progress bar. Uses the current position vs. a straight-line route
+  // from the departure airport, so it's an estimate, not exact.
+  let changed = newState !== state;
+  if (newState.phase === "inbound") {
+    const originCode = newState.legIndex === 0 ? watch.origin : watch.legs[newState.legIndex - 1];
+    const originPos = originCode ? await getAirportPos(originCode) : null;
+    if (originPos && airportPos) {
+      const totalKm = haversineKm(originPos.lat, originPos.lon, airportPos.lat, airportPos.lon);
+      const remainingKm = haversineKm(flight.lat, flight.lon, airportPos.lat, airportPos.lon);
+      const traveledKm = Math.max(0, totalKm - remainingKm);
+      const progressPercent = totalKm > 0 ? (traveledKm / totalKm) * 100 : null;
+      const speedKmh = flight.velocity ? flight.velocity * 1.852 : null; // knots -> km/h
+      const etaMinutes = speedKmh && speedKmh > 5 ? (remainingKm / speedKmh) * 60 : null;
+      newState = { ...newState, progressPercent, distanceRemainingKm: remainingKm, etaMinutes };
+      changed = true;
+    }
+  }
+
+  if (changed) {
     if (notify) await sendNtfy(notify.title, notify.message);
     await postState(watch.id, newState, null);
-    console.log(watch.registration + ": " + state.phase + " -> " + newState.phase);
+    if (newState.phase !== state.phase) console.log(watch.registration + ": " + state.phase + " -> " + newState.phase);
   }
 }
 
