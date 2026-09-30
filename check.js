@@ -3,11 +3,13 @@
 // watch list from the Cloudflare Worker, checks each aircraft's live
 // position across several community ADS-B sources (airplanes.live,
 // adsb.fi, adsb.one, OpenSky — tried in order until one has data), and
-// reports any state change back to the Worker (which sends the ntfy.sh
-// notification).
+// reports any state change back to the Worker to save it. Notifications
+// are sent directly from here (not via the Worker) because ntfy.sh
+// rate-limits Cloudflare's shared IP pool.
 
 const WORKER_URL = process.env.WORKER_URL;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN;
+const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const AIRPORT_RADIUS_KM = 15;
 
 async function main() {
@@ -81,8 +83,26 @@ async function checkWatch(watch) {
   }
 
   if (newState !== state) {
-    await postState(watch.id, newState, notify);
+    if (notify) await sendNtfy(notify.title, notify.message);
+    await postState(watch.id, newState, null);
     console.log(watch.registration + ": " + state.phase + " -> " + newState.phase);
+  }
+}
+
+async function sendNtfy(title, message) {
+  if (!NTFY_TOPIC) {
+    console.log("  NTFY_TOPIC not set as a GitHub secret — skipping notification: " + title);
+    return;
+  }
+  try {
+    const resp = await fetch("https://ntfy.sh/" + NTFY_TOPIC, {
+      method: "POST",
+      headers: { Title: title },
+      body: message
+    });
+    console.log("  ntfy: " + (resp.ok ? "sent" : "HTTP " + resp.status));
+  } catch (e) {
+    console.log("  ntfy send failed: " + e);
   }
 }
 
