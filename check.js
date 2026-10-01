@@ -20,7 +20,7 @@ const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const AIRPORT_RADIUS_KM = 15;
 
 // "Probably landed" heuristic: signal lost for this long...
-const PROBABLE_LANDING_GAP_MIN = 1;
+const PROBABLE_LANDING_GAP_MIN = 20;
 // ...after last being seen within this distance of the target airport...
 const PROBABLE_LANDING_KM = 50;
 // ...and below this altitude (feet).
@@ -261,8 +261,9 @@ async function getAirportPos(icaoCode) {
 
 async function getFlightState(icao24) {
   const sources = [
-    { name: "airplanes.live", url: "https://api.airplanes.live/v2/hex/" + icao24 },
     { name: "adsb.fi", url: "https://opendata.adsb.fi/api/v2/hex/" + icao24 },
+    { name: "adsb.lol", url: "https://api.adsb.lol/v2/hex/" + icao24 },
+    { name: "airplanes.live", url: "https://api.airplanes.live/v2/hex/" + icao24 },
     { name: "adsb.one", url: "https://api.adsb.one/v2/hex/" + icao24 }
   ];
   for (const { name, url } of sources) {
