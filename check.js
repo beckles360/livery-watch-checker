@@ -235,6 +235,65 @@ async function nearestAirport(lat, lon, radiusKm) {
   return data && data.icao ? data : null;
 }
 
+// Flight route (origin and destination airports with coordinates) from the
+// callsign, using adsbdb.com's crowd-sourced route database.
+async function lookupRoute(callsign) {
+  const data = await fetchJson("https://api.adsbdb.com/v0/callsign/" + encodeURIComponent(callsign));
+  const fr = data && data.response && data.response.flightroute;
+  const point = (a) =>
+    a && a.latitude != null && a.longitude != null
+      ? {
+          icao: a.icao_code,
+          label: (a.municipality || a.name || a.icao_code) + " (" + (a.iata_code || a.icao_code) + ")",
+          lat: Number(a.latitude),
+          lon: Number(a.longitude)
+        }
+      : null;
+  const origin = fr && point(fr.origin);
+  const dest = fr && point(fr.destination);
+  return { callsign, ok: !!(origin && dest), origin, dest, checkedAt: Date.now() };
+}
+
+// Fills in progress fields on `next` (the state about to be saved) when the
+// flight's origin and destination can be established and make sense.
+async function addRouteProgress(flight, next, name) {
+  const cs = flight.callsign;
+  let route = next.route || null;
+  const staleMiss = route && !route.ok && Date.now() - route.checkedAt > 30 * 60 * 1000;
+  if (cs && (!route || route.callsign !== cs || staleMiss)) {
+    route = await lookupRoute(cs);
+    next.route = route;
+    console.log(name + ": route for " + cs + " " + (route.ok ? route.origin.label + " -> " + route.dest.label : "not found"));
+  }
+  if (!route || !route.ok) return;
+
+  // Prefer the airport we actually saw it leave; if the database disagrees
+  // with that, the route entry is probably for a different flight.
+  if (next.origin && next.origin.icao !== route.origin.icao) {
+    console.log(name + ": route origin " + route.origin.icao + " != observed " + next.origin.icao + " — ignoring route");
+    return;
+  }
+  const origin = next.origin || route.origin;
+  const dest = route.dest;
+
+  const totalKm = haversineKm(origin.lat, origin.lon, dest.lat, dest.lon);
+  const viaKm =
+    haversineKm(origin.lat, origin.lon, flight.lat, flight.lon) +
+    haversineKm(flight.lat, flight.lon, dest.lat, dest.lon);
+  if (totalKm < 50 || viaKm > totalKm * 1.25 + 100) {
+    console.log(name + ": position doesn't fit " + origin.icao + " -> " + dest.icao + " — ignoring route");
+    return;
+  }
+
+  const remainingKm = haversineKm(flight.lat, flight.lon, dest.lat, dest.lon);
+  const speedKmh = flight.velocity ? flight.velocity * 1.852 : null; // knots -> km/h
+  next.routeOrigin = origin;
+  next.routeDest = dest;
+  next.progressPercent = Math.max(0, Math.min(100, ((totalKm - remainingKm) / totalKm) * 100));
+  next.distanceRemainingKm = remainingKm;
+  next.etaMinutes = speedKmh && speedKmh > 5 ? (remainingKm / speedKmh) * 60 : null;
+}
+
 async function checkFreeWatch(watch) {
   const tail = watch.registration || "";
   const callsign = (watch.callsignPrefix || "").toUpperCase();
@@ -297,16 +356,25 @@ async function checkFreeWatch(watch) {
       let from = null;
       if (state.phase === "ground" && state.atAirport) {
         const here = await nearestAirport(flight.lat, flight.lon, 40);
-        if (here && here.icao === state.atAirport) from = state.atAirportName || here.label;
+        if (here && here.icao === state.atAirport) {
+          from = state.atAirportName || here.label;
+          next.origin = { icao: here.icao, label: here.label, lat: here.lat, lon: here.lon };
+        }
       }
       notify = {
         title: name + (from ? " has departed " + from : " is in the air"),
         message: details
       };
+    } else {
+      // Still the same flight: carry over what we already worked out.
+      next.origin = state.origin || null;
+      next.route = state.route || null;
     }
     next.phase = "air";
     next.atAirport = null;
     next.atAirportName = null;
+    await addRouteProgress(flight, next, name);
+    if (notify && next.routeDest) notify.message = "Heading to " + next.routeDest.label + ". " + notify.message;
   }
 
   console.log(
