@@ -20,7 +20,7 @@ const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const AIRPORT_RADIUS_KM = 15;
 
 // "Probably landed" heuristic: signal lost for this long...
-const PROBABLE_LANDING_GAP_MIN = 20;
+const PROBABLE_LANDING_GAP_MIN = 1;
 // ...after last being seen within this distance of the target airport...
 const PROBABLE_LANDING_KM = 50;
 // ...and below this altitude (feet).
