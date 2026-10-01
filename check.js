@@ -56,6 +56,9 @@ function airportLabel(watch, idx) {
 }
 
 async function checkWatch(watch) {
+  // No airports entered: free-roam watch, alert on every takeoff and landing.
+  if (!watch.legs || watch.legs.length === 0) return checkFreeWatch(watch);
+
   const icao24 = await getIcao24(watch.registration);
   if (!icao24) {
     console.log(watch.registration + ": could not resolve ICAO24 (adsbdb.com lookup failed)");
@@ -223,6 +226,145 @@ async function checkProbableArrival(watch, state) {
   await postState(watch.id, newState, null);
 }
 
+// ---- Free-roam watches ---------------------------------------------------
+// No route: track a tail number and/or callsign and alert on every takeoff
+// and landing, naming the nearest airport. Phases: unknown | ground | air.
+
+const STALE_AIR_HOURS = 6;
+
+async function nearestAirport(lat, lon, radiusKm) {
+  if (lat == null || lon == null) return null;
+  const data = await fetchJson(
+    WORKER_URL + "/api/airports/nearest?lat=" + lat + "&lon=" + lon + "&km=" + radiusKm
+  );
+  return data && data.icao ? data : null;
+}
+
+async function checkFreeWatch(watch) {
+  const tail = watch.registration || "";
+  const callsign = (watch.callsignPrefix || "").toUpperCase();
+  const name = tail || callsign;
+
+  let flight = null;
+  if (tail) {
+    const icao24 = await getIcao24(tail);
+    if (!icao24) {
+      console.log(name + ": could not resolve ICAO24 (adsbdb.com lookup failed)");
+      return;
+    }
+    flight = await getFlight("hex", icao24);
+    if (flight && callsign && !(flight.callsign || "").toUpperCase().startsWith(callsign)) {
+      console.log(name + ": flying as " + (flight.callsign || "?") + ", not " + callsign + " — ignoring");
+      return;
+    }
+  } else {
+    flight = await getFlight("callsign", callsign);
+  }
+
+  const raw = watch.state && watch.state.mode === "free" ? watch.state : null;
+  let state = raw || { mode: "free", phase: "unknown", atAirport: null };
+  // Last seen airborne many hours ago: it has certainly landed somewhere unseen.
+  if (state.phase === "air" && state.lastSeen &&
+      Date.now() - Date.parse(state.lastSeen.at) > STALE_AIR_HOURS * 3600 * 1000) {
+    state = { ...state, phase: "unknown", atAirport: null, atAirportName: null };
+  }
+
+  if (!flight) {
+    console.log(name + ": no current position from any source (phase=" + state.phase + ")");
+    await checkFreeProbableLanding(watch, state, name);
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+  const groundLike =
+    flight.onGround ||
+    (flight.altFt != null && flight.altFt <= 200 && flight.velocity != null && flight.velocity < 80);
+
+  const next = {
+    mode: "free",
+    hex: flight.hex,
+    lastSeen: { lat: flight.lat, lon: flight.lon, altFt: flight.altFt, at: nowIso },
+    updatedAt: state.updatedAt || nowIso
+  };
+  const who = flight.registration && !tail ? " (" + flight.registration + ")" : "";
+  const details = "Callsign " + (flight.callsign || "unknown") + who + "." + (watch.livery ? " " + watch.livery : "");
+  let notify = null;
+
+  if (groundLike) {
+    const airport = await nearestAirport(flight.lat, flight.lon, AIRPORT_RADIUS_KM);
+    if (state.phase === "air") {
+      notify = {
+        title: name + " has landed" + (airport ? " at " + airport.label : ""),
+        message: details
+      };
+    }
+    next.phase = "ground";
+    next.atAirport = airport ? airport.icao : null;
+    next.atAirportName = airport ? airport.label : null;
+  } else {
+    if (state.phase !== "air") {
+      let from = null;
+      if (state.phase === "ground" && state.atAirport) {
+        const here = await nearestAirport(flight.lat, flight.lon, 40);
+        if (here && here.icao === state.atAirport) from = state.atAirportName || here.label;
+      }
+      notify = {
+        title: name + (from ? " has departed " + from : " is in the air"),
+        message: details
+      };
+    }
+    next.phase = "air";
+    next.atAirport = null;
+    next.atAirportName = null;
+  }
+
+  console.log(
+    name + ": phase " + state.phase + " -> " + next.phase +
+    " callsign=" + (flight.callsign || "?") + " onGround=" + flight.onGround +
+    (next.atAirportName ? " at=" + next.atAirportName : "")
+  );
+
+  if (notify) next.updatedAt = nowIso;
+
+  // Save on any change; while airborne also refresh the last-seen position
+  // (used for the probable-landing check). Parked and unchanged: no write.
+  const changed =
+    !raw || notify || next.phase !== state.phase ||
+    next.atAirport !== (state.atAirport || null) || next.phase === "air";
+  if (changed) {
+    if (notify) await sendNtfy(notify.title, notify.message);
+    await postState(watch.id, next, null);
+  }
+}
+
+// No position right now. If it was last seen low and close to an airport and
+// then went quiet, assume it landed in a coverage hole.
+async function checkFreeProbableLanding(watch, state, name) {
+  if (state.phase !== "air" || !state.lastSeen) return;
+  const ageMin = (Date.now() - Date.parse(state.lastSeen.at)) / 60000;
+  if (!(ageMin >= PROBABLE_LANDING_GAP_MIN)) return;
+  if (state.lastSeen.altFt != null && state.lastSeen.altFt > PROBABLE_LANDING_MAX_ALT_FT) return;
+
+  const airport = await nearestAirport(state.lastSeen.lat, state.lastSeen.lon, PROBABLE_LANDING_KM);
+  if (!airport) return;
+
+  console.log(name + ": signal lost " + Math.round(ageMin) + " min ago near " + airport.label + " — assuming probable landing");
+  const nowIso = new Date().toISOString();
+  await sendNtfy(
+    name + " has probably landed at " + airport.label,
+    "Lost signal on approach (" + Math.round(ageMin) + " min ago). " + (watch.livery || "")
+  );
+  await postState(watch.id, {
+    mode: "free",
+    hex: state.hex,
+    phase: "ground",
+    atAirport: airport.icao,
+    atAirportName: airport.label,
+    lastSeen: state.lastSeen,
+    updatedAt: nowIso
+  }, null);
+}
+
 async function sendNtfy(title, message) {
   if (!NTFY_TOPIC) {
     console.log("  NTFY_TOPIC not set as a GitHub secret — skipping notification: " + title);
@@ -260,11 +402,18 @@ async function getAirportPos(icaoCode) {
 }
 
 async function getFlightState(icao24) {
+  return getFlight("hex", icao24);
+}
+
+// kind is "hex" (ICAO24 address) or "callsign". Callsign lookups skip
+// OpenSky, which can't search by callsign.
+async function getFlight(kind, value) {
+  const path = kind === "callsign" ? "/callsign/" : "/hex/";
   const sources = [
-    { name: "adsb.fi", url: "https://opendata.adsb.fi/api/v2/hex/" + icao24 },
-    { name: "adsb.lol", url: "https://api.adsb.lol/v2/hex/" + icao24 },
-    { name: "airplanes.live", url: "https://api.airplanes.live/v2/hex/" + icao24 },
-    { name: "adsb.one", url: "https://api.adsb.one/v2/hex/" + icao24 }
+    { name: "adsb.fi", url: "https://opendata.adsb.fi/api/v2" + path + encodeURIComponent(value) },
+    { name: "adsb.lol", url: "https://api.adsb.lol/v2" + path + encodeURIComponent(value) },
+    { name: "airplanes.live", url: "https://api.airplanes.live/v2" + path + encodeURIComponent(value) },
+    { name: "adsb.one", url: "https://api.adsb.one/v2" + path + encodeURIComponent(value) }
   ];
   for (const { name, url } of sources) {
     try {
@@ -276,7 +425,10 @@ async function getFlightState(icao24) {
         continue;
       }
       const data = await resp.json();
-      const ac = data.ac && data.ac[0];
+      const list = (data.ac || []).filter((a) => a.lat != null && a.lon != null);
+      const ac = kind === "callsign"
+        ? list.find((a) => (a.flight || "").trim().toUpperCase() === value) || null
+        : list[0] || (data.ac && data.ac[0]);
       if (!ac) {
         console.log("  " + name + ": reached OK, but no aircraft in response (ac: " + JSON.stringify(data.ac) + ")");
         continue;
@@ -287,6 +439,8 @@ async function getFlightState(icao24) {
       }
       console.log("  (source: " + name + ")");
       return {
+        hex: ac.hex,
+        registration: ac.r || null,
         callsign: (ac.flight || "").trim(),
         lon: ac.lon,
         lat: ac.lat,
@@ -299,7 +453,8 @@ async function getFlightState(icao24) {
       console.log("  " + name + ": request failed — " + e);
     }
   }
-  const fromOpenSky = await getFlightStateFromOpenSky(icao24, true).catch((e) => {
+  if (kind !== "hex") return null;
+  const fromOpenSky = await getFlightStateFromOpenSky(value, true).catch((e) => {
     console.log("  OpenSky: request failed — " + e);
     return null;
   });
@@ -329,6 +484,7 @@ async function getFlightStateFromOpenSky(icao24, verbose) {
     return null;
   }
   return {
+    hex: row[0],
     callsign: (row[1] || "").trim(),
     lon: row[5],
     lat: row[6],
