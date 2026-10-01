@@ -60,16 +60,11 @@ async function checkWatch(watch) {
   if (!watch.legs || watch.legs.length === 0) return checkFreeWatch(watch);
 
   const icao24 = await getIcao24(watch.registration);
-  if (!icao24) {
-    console.log(watch.registration + ": could not resolve ICAO24 (adsbdb.com lookup failed)");
-    return;
-  }
-
   const state = watch.state || { legIndex: 0, phase: "idle" };
-  const flight = await getFlightState(icao24);
+  const flight = icao24 ? await getFlightState(icao24) : null;
 
   if (!flight) {
-    console.log(watch.registration + " (" + icao24 + "): no current position from any source");
+    console.log(watch.registration + (icao24 ? " (" + icao24 + ")" : "") + ": no current position from any source");
     await checkProbableArrival(watch, state);
     return;
   }
@@ -248,11 +243,7 @@ async function checkFreeWatch(watch) {
   let flight = null;
   if (tail) {
     const icao24 = await getIcao24(tail);
-    if (!icao24) {
-      console.log(name + ": could not resolve ICAO24 (adsbdb.com lookup failed)");
-      return;
-    }
-    flight = await getFlight("hex", icao24);
+    flight = icao24 ? await getFlight("hex", icao24) : null;
     if (flight && callsign && !(flight.callsign || "").toUpperCase().startsWith(callsign)) {
       console.log(name + ": flying as " + (flight.callsign || "?") + ", not " + callsign + " — ignoring");
       return;
@@ -382,10 +373,28 @@ async function sendNtfy(title, message) {
   }
 }
 
+// Registration -> ICAO24 hex. adsbdb.com first; it can be missing newly
+// registered aircraft, so fall back to asking the live ADS-B sources, which
+// know the registration of anything currently transmitting.
 async function getIcao24(registration) {
-  const data = await fetchJson("https://api.adsbdb.com/v0/aircraft/" + encodeURIComponent(registration));
-  const a = data && data.response && data.response.aircraft;
-  return a && a.mode_s ? a.mode_s.toLowerCase() : null;
+  try {
+    const resp = await fetch("https://api.adsbdb.com/v0/aircraft/" + encodeURIComponent(registration));
+    if (resp.ok) {
+      const data = await resp.json();
+      const a = data && data.response && data.response.aircraft;
+      if (a && a.mode_s) return a.mode_s.toLowerCase();
+    }
+    console.log("  adsbdb.com: no ICAO24 for " + registration + " (HTTP " + resp.status + ") — trying live sources");
+  } catch (e) {
+    console.log("  adsbdb.com: request failed — " + e + " — trying live sources");
+  }
+  const live = await getFlight("reg", registration.toUpperCase());
+  if (live && live.hex) {
+    console.log("  resolved " + registration + " to " + live.hex + " via " + live.source);
+    return live.hex.toLowerCase();
+  }
+  console.log("  could not resolve ICAO24 for " + registration + " (not in adsbdb and not currently transmitting)");
+  return null;
 }
 
 // Cached per run so checking every leg for every watch stays cheap.
@@ -408,12 +417,16 @@ async function getFlightState(icao24) {
 // kind is "hex" (ICAO24 address) or "callsign". Callsign lookups skip
 // OpenSky, which can't search by callsign.
 async function getFlight(kind, value) {
-  const path = kind === "callsign" ? "/callsign/" : "/hex/";
+  // kind: "hex" | "callsign" | "reg". The registration endpoint is named
+  // differently on different services.
+  const seg = (longReg) =>
+    kind === "callsign" ? "/callsign/" : kind === "reg" ? (longReg ? "/registration/" : "/reg/") : "/hex/";
+  const q = encodeURIComponent(value);
   const sources = [
-    { name: "adsb.fi", url: "https://opendata.adsb.fi/api/v2" + path + encodeURIComponent(value) },
-    { name: "adsb.lol", url: "https://api.adsb.lol/v2" + path + encodeURIComponent(value) },
-    { name: "airplanes.live", url: "https://api.airplanes.live/v2" + path + encodeURIComponent(value) },
-    { name: "adsb.one", url: "https://api.adsb.one/v2" + path + encodeURIComponent(value) }
+    { name: "adsb.fi", url: "https://opendata.adsb.fi/api/v2" + seg(true) + q },
+    { name: "adsb.lol", url: "https://api.adsb.lol/v2" + seg(true) + q },
+    { name: "airplanes.live", url: "https://api.airplanes.live/v2" + seg(false) + q },
+    { name: "adsb.one", url: "https://api.adsb.one/v2" + seg(false) + q }
   ];
   for (const { name, url } of sources) {
     try {
@@ -428,7 +441,9 @@ async function getFlight(kind, value) {
       const list = (data.ac || []).filter((a) => a.lat != null && a.lon != null);
       const ac = kind === "callsign"
         ? list.find((a) => (a.flight || "").trim().toUpperCase() === value) || null
-        : list[0] || (data.ac && data.ac[0]);
+        : kind === "reg"
+          ? list.find((a) => (a.r || "").toUpperCase() === value) || null
+          : list[0] || (data.ac && data.ac[0]);
       if (!ac) {
         console.log("  " + name + ": reached OK, but no aircraft in response (ac: " + JSON.stringify(data.ac) + ")");
         continue;
