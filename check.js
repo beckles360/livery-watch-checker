@@ -333,6 +333,8 @@ async function checkFreeWatch(watch) {
   const next = {
     mode: "free",
     hex: flight.hex,
+    registration: flight.registration || tail || null,
+    aircraft: flight.desc || state.aircraft || null,
     lastSeen: { lat: flight.lat, lon: flight.lon, altFt: flight.altFt, at: nowIso },
     updatedAt: state.updatedAt || nowIso
   };
@@ -388,7 +390,7 @@ async function checkFreeWatch(watch) {
   // Save on any change; while airborne also refresh the last-seen position
   // (used for the probable-landing check). Parked and unchanged: no write.
   const changed =
-    !raw || notify || next.phase !== state.phase ||
+    !raw || notify || next.phase !== state.phase || next.registration !== (state.registration || null) || next.aircraft !== (state.aircraft || null) ||
     next.atAirport !== (state.atAirport || null) || next.phase === "air";
   if (changed) {
     if (notify) await sendNtfy(notify.title, notify.message);
@@ -416,6 +418,8 @@ async function checkFreeProbableLanding(watch, state, name) {
   await postState(watch.id, {
     mode: "free",
     hex: state.hex,
+    registration: state.registration || null,
+    aircraft: state.aircraft || null,
     phase: "ground",
     atAirport: airport.icao,
     atAirportName: airport.label,
@@ -524,6 +528,7 @@ async function getFlight(kind, value) {
       return {
         hex: ac.hex,
         registration: ac.r || null,
+        desc: ac.desc || null,
         callsign: (ac.flight || "").trim(),
         lon: ac.lon,
         lat: ac.lat,
