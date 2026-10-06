@@ -259,10 +259,22 @@ async function lookupRoute(callsign) {
 async function addRouteProgress(flight, next, name) {
   const cs = flight.callsign;
   let route = next.route || null;
-  const staleMiss = route && !route.ok && Date.now() - route.checkedAt > 30 * 60 * 1000;
-  if (cs && (!route || route.callsign !== cs || staleMiss)) {
-    route = await lookupRoute(cs);
+  // Look the route up again when the callsign changes, and re-check it every
+  // 20 minutes (30 if nothing was found) so a stale or corrected entry can't stick.
+  const ageMs = route ? Date.now() - route.checkedAt : Infinity;
+  const needLookup =
+    cs && (!route || route.callsign !== cs || ageMs > (route.ok ? 20 : 30) * 60 * 1000);
+  let source = "cached";
+  if (needLookup) {
+    const fresh = await lookupRoute(cs);
+    // A failed re-check shouldn't wipe a route we already had for this callsign.
+    const keepOld = route && route.ok && route.callsign === cs && !fresh.ok;
+    if (route && route.ok && route.callsign === cs && fresh.ok && route.dest.icao !== fresh.dest.icao) {
+      console.log(name + ": route for " + cs + " changed " + route.dest.icao + " -> " + fresh.dest.icao);
+    }
+    route = keepOld ? { ...route, checkedAt: Date.now() } : fresh;
     next.route = route;
+    source = keepOld ? "cached" : "fresh";
     console.log(name + ": route for " + cs + " " + (route.ok ? route.origin.label + " -> " + route.dest.label : "not found"));
   }
   if (!route || !route.ok) return;
@@ -287,6 +299,7 @@ async function addRouteProgress(flight, next, name) {
 
   const remainingKm = haversineKm(flight.lat, flight.lon, dest.lat, dest.lon);
   const speedKmh = flight.velocity ? flight.velocity * 1.852 : null; // knots -> km/h
+  console.log(name + ": using " + origin.icao + " -> " + dest.icao + " (" + source + " route for " + route.callsign + ")");
   next.routeOrigin = origin;
   next.routeDest = dest;
   next.progressPercent = Math.max(0, Math.min(100, ((totalKm - remainingKm) / totalKm) * 100));
@@ -334,6 +347,7 @@ async function checkFreeWatch(watch) {
     mode: "free",
     hex: flight.hex,
     registration: flight.registration || tail || null,
+    callsign: flight.callsign || state.callsign || null,
     aircraft: flight.desc || state.aircraft || null,
     lastSeen: { lat: flight.lat, lon: flight.lon, altFt: flight.altFt, at: nowIso },
     updatedAt: state.updatedAt || nowIso
@@ -354,7 +368,15 @@ async function checkFreeWatch(watch) {
     next.atAirport = airport ? airport.icao : null;
     next.atAirportName = airport ? airport.label : null;
   } else {
-    if (state.phase !== "air") {
+    // A different callsign while we think it's still airborne means a new flight
+    // started that we never saw begin (landing + takeoff inside a coverage gap).
+    // Don't carry the previous flight's origin or route over to it.
+    const newFlight =
+      state.phase === "air" && state.callsign && flight.callsign && state.callsign !== flight.callsign;
+    if (newFlight) {
+      console.log(name + ": callsign changed " + state.callsign + " -> " + flight.callsign + " — treating as a new flight");
+    }
+    if (state.phase !== "air" || newFlight) {
       let from = null;
       if (state.phase === "ground" && state.atAirport) {
         const here = await nearestAirport(flight.lat, flight.lon, 40);
