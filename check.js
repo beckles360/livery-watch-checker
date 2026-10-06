@@ -235,23 +235,105 @@ async function nearestAirport(lat, lon, radiusKm) {
   return data && data.icao ? data : null;
 }
 
-// Flight route (origin and destination airports with coordinates) from the
-// callsign, using adsbdb.com's crowd-sourced route database.
+// ---- Flight routes ---------------------------------------------------------
+// A route is an ordered list of stops. Some flights are one-stop under a single
+// callsign (e.g. Frankfurt -> Lagos -> Malabo), and a plain origin/destination
+// pair would then show the final destination while the plane is really headed
+// for the intermediate stop. So we try VRS standing data first (it can list
+// every stop) and fall back to adsbdb.com's origin/destination pair.
+
+// Ordered ICAO codes for a callsign from the community VRS standing data, or null.
+async function lookupVrsCodes(callsign) {
+  const data = await fetchJson(
+    "https://vrs-standing-data.adsb.lol/routes/" + callsign.slice(0, 2) + "/" + encodeURIComponent(callsign) + ".json"
+  );
+  if (!data) return null;
+  const codes = String(data.airport_codes || "")
+    .split("-")
+    .map((c) => c.trim().toUpperCase())
+    .filter((c) => /^[A-Z0-9]{4}$/.test(c));
+  return codes.length >= 2 ? codes : null;
+}
+
+// Turn ICAO codes into stops with coordinates and a readable label, or null.
+async function stopsFromCodes(codes) {
+  const stops = [];
+  for (const icao of codes) {
+    const pos = await getAirportPos(icao);
+    if (!pos) return null;
+    const near = await nearestAirport(pos.lat, pos.lon, 10);
+    stops.push({
+      icao,
+      label: near && near.icao === icao ? near.label : pos.name || icao,
+      lat: pos.lat,
+      lon: pos.lon
+    });
+  }
+  return stops;
+}
+
 async function lookupRoute(callsign) {
-  const data = await fetchJson("https://api.adsbdb.com/v0/callsign/" + encodeURIComponent(callsign));
-  const fr = data && data.response && data.response.flightroute;
-  const point = (a) =>
-    a && a.latitude != null && a.longitude != null
-      ? {
-          icao: a.icao_code,
-          label: (a.municipality || a.name || a.icao_code) + " (" + (a.iata_code || a.icao_code) + ")",
-          lat: Number(a.latitude),
-          lon: Number(a.longitude)
-        }
-      : null;
-  const origin = fr && point(fr.origin);
-  const dest = fr && point(fr.destination);
-  return { callsign, ok: !!(origin && dest), origin, dest, checkedAt: Date.now() };
+  let stops = null;
+  let via = null;
+  try {
+    const codes = await lookupVrsCodes(callsign);
+    if (codes) {
+      stops = await stopsFromCodes(codes);
+      if (stops) via = "vrs";
+    }
+  } catch (e) {
+    console.log("  VRS route lookup failed — " + e);
+  }
+  if (!stops) {
+    const data = await fetchJson("https://api.adsbdb.com/v0/callsign/" + encodeURIComponent(callsign));
+    const fr = data && data.response && data.response.flightroute;
+    const point = (a) =>
+      a && a.latitude != null && a.longitude != null
+        ? {
+            icao: a.icao_code,
+            label: (a.municipality || a.name || a.icao_code) + " (" + (a.iata_code || a.icao_code) + ")",
+            lat: Number(a.latitude),
+            lon: Number(a.longitude)
+          }
+        : null;
+    const origin = fr && point(fr.origin);
+    const dest = fr && point(fr.destination);
+    if (origin && dest) {
+      stops = [origin, dest];
+      via = "adsbdb";
+    }
+  }
+  return { callsign, ok: !!stops, stops: stops || [], via, checkedAt: Date.now() };
+}
+
+function describeStops(route) {
+  return route.stops.map((s) => s.icao).join(" -> ");
+}
+
+// Which leg of the route is the aircraft flying right now?
+// - If we saw it take off from one of the stops, it is flying to the next one.
+// - If we saw it take off from somewhere not on the list, assume it is heading
+//   for the final stop.
+// - Otherwise pick the leg its position fits best.
+function chooseLeg(stops, pos, observed) {
+  const n = stops.length;
+  if (observed) {
+    const i = stops.findIndex((s) => s.icao === observed.icao);
+    if (i >= 0) return i < n - 1 ? { origin: stops[i], dest: stops[i + 1] } : null;
+    return { origin: observed, dest: stops[n - 1] };
+  }
+  let best = null;
+  for (let i = 0; i < n - 1; i++) {
+    const a = stops[i];
+    const b = stops[i + 1];
+    const seg = haversineKm(a.lat, a.lon, b.lat, b.lon);
+    const via = haversineKm(a.lat, a.lon, pos.lat, pos.lon) + haversineKm(pos.lat, pos.lon, b.lat, b.lon);
+    const detour = via - seg;
+    if (seg >= 50 && via <= seg * 1.25 + 100 && (!best || detour < best.detour)) {
+      best = { origin: a, dest: b, detour };
+    }
+  }
+  return best;
 }
 
 // Fills in progress fields on `next` (the state about to be saved) when the
@@ -263,30 +345,28 @@ async function addRouteProgress(flight, next, name) {
   // 20 minutes (30 if nothing was found) so a stale or corrected entry can't stick.
   const ageMs = route ? Date.now() - route.checkedAt : Infinity;
   const needLookup =
-    cs && (!route || route.callsign !== cs || ageMs > (route.ok ? 20 : 30) * 60 * 1000);
+    cs && (!route || !route.stops || route.callsign !== cs || ageMs > (route.ok ? 20 : 30) * 60 * 1000);
   let source = "cached";
   if (needLookup) {
     const fresh = await lookupRoute(cs);
     // A failed re-check shouldn't wipe a route we already had for this callsign.
-    const keepOld = route && route.ok && route.callsign === cs && !fresh.ok;
-    if (route && route.ok && route.callsign === cs && fresh.ok && route.dest.icao !== fresh.dest.icao) {
-      console.log(name + ": route for " + cs + " changed " + route.dest.icao + " -> " + fresh.dest.icao);
+    const keepOld = route && route.ok && route.stops && route.callsign === cs && !fresh.ok;
+    if (route && route.ok && route.stops && route.callsign === cs && fresh.ok && describeStops(route) !== describeStops(fresh)) {
+      console.log(name + ": route for " + cs + " changed " + describeStops(route) + " -> " + describeStops(fresh));
     }
     route = keepOld ? { ...route, checkedAt: Date.now() } : fresh;
     next.route = route;
     source = keepOld ? "cached" : "fresh";
-    console.log(name + ": route for " + cs + " " + (route.ok ? route.origin.label + " -> " + route.dest.label : "not found"));
+    console.log(name + ": route for " + cs + " " + (route.ok ? describeStops(route) + " (" + route.via + ")" : "not found"));
   }
-  if (!route || !route.ok) return;
+  if (!route || !route.ok || !route.stops) return;
 
-  // Prefer the airport we actually saw it leave; if the database disagrees
-  // with that, the route entry is probably for a different flight.
-  if (next.origin && next.origin.icao !== route.origin.icao) {
-    console.log(name + ": route origin " + route.origin.icao + " != observed " + next.origin.icao + " — ignoring route");
+  const leg = chooseLeg(route.stops, flight, next.origin);
+  if (!leg) {
+    console.log(name + ": position doesn't fit any leg of " + describeStops(route) + " — ignoring route");
     return;
   }
-  const origin = next.origin || route.origin;
-  const dest = route.dest;
+  const { origin, dest } = leg;
 
   const totalKm = haversineKm(origin.lat, origin.lon, dest.lat, dest.lon);
   const viaKm =
@@ -367,6 +447,8 @@ async function checkFreeWatch(watch) {
     next.phase = "ground";
     next.atAirport = airport ? airport.icao : null;
     next.atAirportName = airport ? airport.label : null;
+    next.atAirportLat = airport ? airport.lat : null;
+    next.atAirportLon = airport ? airport.lon : null;
   } else {
     // A different callsign while we think it's still airborne means a new flight
     // started that we never saw begin (landing + takeoff inside a coverage gap).
@@ -379,8 +461,17 @@ async function checkFreeWatch(watch) {
     if (state.phase !== "air" || newFlight) {
       let from = null;
       if (state.phase === "ground" && state.atAirport) {
-        const here = await nearestAirport(flight.lat, flight.lon, 40);
-        if (here && here.icao === state.atAirport) {
+        let here = null;
+        if (state.atAirportLat != null && state.atAirportLon != null) {
+          // First airborne sighting can be a long way out if coverage is thin: allow 200 km.
+          if (haversineKm(flight.lat, flight.lon, state.atAirportLat, state.atAirportLon) <= 200) {
+            here = { icao: state.atAirport, label: state.atAirportName || state.atAirport, lat: state.atAirportLat, lon: state.atAirportLon };
+          }
+        } else {
+          const near = await nearestAirport(flight.lat, flight.lon, 40);
+          if (near && near.icao === state.atAirport) here = near;
+        }
+        if (here) {
           from = state.atAirportName || here.label;
           next.origin = { icao: here.icao, label: here.label, lat: here.lat, lon: here.lon };
         }
@@ -397,6 +488,8 @@ async function checkFreeWatch(watch) {
     next.phase = "air";
     next.atAirport = null;
     next.atAirportName = null;
+    next.atAirportLat = null;
+    next.atAirportLon = null;
     await addRouteProgress(flight, next, name);
     if (notify && next.routeDest) notify.message = "Heading to " + next.routeDest.label + ". " + notify.message;
   }
@@ -445,6 +538,8 @@ async function checkFreeProbableLanding(watch, state, name) {
     phase: "ground",
     atAirport: airport.icao,
     atAirportName: airport.label,
+    atAirportLat: airport.lat,
+    atAirportLon: airport.lon,
     lastSeen: state.lastSeen,
     updatedAt: nowIso
   }, null);
@@ -499,7 +594,7 @@ async function getAirportPos(icaoCode) {
   const data = await fetchJson("https://hexdb.io/api/v1/airport/icao/" + encodeURIComponent(icaoCode));
   const pos = !data || data.latitude == null
     ? null
-    : { lat: parseFloat(data.latitude), lon: parseFloat(data.longitude) };
+    : { lat: parseFloat(data.latitude), lon: parseFloat(data.longitude), name: data.airport || null };
   airportPosCache.set(icaoCode, pos);
   return pos;
 }
