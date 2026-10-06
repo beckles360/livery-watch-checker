@@ -149,7 +149,7 @@ async function checkWatch(watch) {
   if (newState.phase === "inbound") {
     newState = {
       ...newState,
-      lastSeen: { lat: flight.lat, lon: flight.lon, altFt: flight.altFt, at: nowIso }
+      lastSeen: { lat: flight.lat, lon: flight.lon, altFt: flight.altFt, track: flight.track, at: nowIso }
     };
     changed = true;
 
@@ -163,7 +163,13 @@ async function checkWatch(watch) {
       const progressPercent = totalKm > 0 ? (traveledKm / totalKm) * 100 : null;
       const speedKmh = flight.velocity ? flight.velocity * 1.852 : null; // knots -> km/h
       const etaMinutes = speedKmh && speedKmh > 5 ? (remainingKm / speedKmh) * 60 : null;
-      newState = { ...newState, progressPercent, distanceRemainingKm: remainingKm, etaMinutes };
+      const stop = (icao, pos, idx) => ({ icao, label: idx != null ? airportLabel(watch, idx) : pos.name || icao, lat: pos.lat, lon: pos.lon });
+      newState = {
+        ...newState,
+        progressPercent, distanceRemainingKm: remainingKm, etaMinutes,
+        routeOrigin: stop(originCode, originPos, newState.legIndex === 0 ? null : newState.legIndex - 1),
+        routeDest: stop(watch.legs[newState.legIndex], newTargetPos, newState.legIndex)
+      };
     }
   }
 
@@ -429,7 +435,7 @@ async function checkFreeWatch(watch) {
     registration: flight.registration || tail || null,
     callsign: flight.callsign || state.callsign || null,
     aircraft: flight.desc || state.aircraft || null,
-    lastSeen: { lat: flight.lat, lon: flight.lon, altFt: flight.altFt, at: nowIso },
+    lastSeen: { lat: flight.lat, lon: flight.lon, altFt: flight.altFt, track: flight.track, at: nowIso },
     updatedAt: state.updatedAt || nowIso
   };
   const who = flight.registration && !tail ? " (" + flight.registration + ")" : "";
@@ -652,6 +658,7 @@ async function getFlight(kind, value) {
         onGround: ac.alt_baro === "ground",
         altFt: typeof ac.alt_baro === "number" ? ac.alt_baro : null,
         velocity: ac.gs, // knots
+        track: typeof ac.track === "number" ? ac.track : null, // heading, degrees
         source: name
       };
     } catch (e) {
@@ -695,7 +702,8 @@ async function getFlightStateFromOpenSky(icao24, verbose) {
     lat: row[6],
     onGround: row[8],
     altFt: row[7] != null ? row[7] * 3.28084 : null, // metres -> feet
-    velocity: row[9] != null ? row[9] * 1.94384 : null // m/s -> knots (matches the other sources)
+    velocity: row[9] != null ? row[9] * 1.94384 : null, // m/s -> knots (matches the other sources)
+    track: row[10] != null ? row[10] : null // heading, degrees
   };
 }
 
